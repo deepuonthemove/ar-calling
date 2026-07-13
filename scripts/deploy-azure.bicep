@@ -1,0 +1,9 @@
+targetScope = 'subscription'
+param location string = 'eastus2'
+param rgName string = 'rg-ar-voice-agent'
+param openAiName string = 'oai-ar-agent-${uniqueString(subscription().id)}'
+resource rg 'Microsoft.Resources/resourceGroups@2023-07-01' = { name: rgName, location: location }
+resource openAi 'Microsoft.CognitiveServices/accounts@2023-05-01' = { name: openAiName, location: location, kind: 'OpenAI', sku: { name: 'S0' }, properties: { customSubDomainName: openAiName, publicNetworkAccess: 'Enabled' } }
+resource deployment 'Microsoft.CognitiveServices/accounts/deployments@2023-05-01' = { parent: openAi, name: 'ar-agent-mini', sku: { name: 'Standard', capacity: 10 }, properties: { model: { format: 'OpenAI', name: 'gpt-4o-mini', version: '2024-07-18' } } }
+output endpoint string = openAi.properties.endpoint
+output apiKey string = listKeys(openAi.id, '2023-05-01').key1

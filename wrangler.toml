@@ -1,0 +1,17 @@
+name = "ar-voice-agent"
+main = "src/index.ts"
+compatibility_date = "2024-07-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[durable_objects.bindings]]
+name = "CALL_SESSION"
+class_name = "CallSession"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["CallSession"]
+
+[vars]
+AZURE_OPENAI_API_VERSION = "2024-02-01"
+AZURE_OPENAI_DEPLOYMENT = "ar-agent-mini"
+CARTESIA_VOICE_ID = "a0e99841-438c-4a64-b679-ae501e7d6091"
