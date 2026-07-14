@@ -7,6 +7,10 @@ export interface Env {
   CARTESIA_VOICE_ID: string
   OPENAI_API_KEY: string;
   LLM_MODEL: string; // add this
+  TWILIO_ACCOUNT_SID?: string
+  TWILIO_AUTH_TOKEN?: string
+  TWILIO_FROM_NUMBER?: string
+  AI?: any
 }
 
 export interface CallResult {

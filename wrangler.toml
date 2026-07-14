@@ -12,5 +12,8 @@ tag = "v1"
 new_sqlite_classes = ["CallSession"]
 
 [vars]
-LLM_MODEL = "gpt-5-nano"
+LLM_MODEL = "@cf/meta/llama-3.1-8b-instruct-fp8"
 CARTESIA_VOICE_ID = "a0e99841-438c-4a64-b679-ae501e7d6091"
+
+[ai]
+binding = "AI"
