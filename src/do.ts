@@ -8,11 +8,13 @@ export class CallSession {
   state: DurableObjectState
   env: Env
   sessions: Set<WebSocket>
+  redis: Redis
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state
     this.env = env
     this.sessions = new Set()
+    this.redis = Redis.fromEnv(this.env)
   }
 
   async fetch(request: Request) {
@@ -58,11 +60,12 @@ export class CallSession {
       return
     }
 
-    const redis = Redis.fromEnv(this.env)
+    const redis = this.redis
 
     let streamSid = ''
     let isBotSpeaking = false
     let silenceMs = 0
+    let isCallEnded = false
 
     const silenceTimer = setInterval(() => {
       silenceMs += 100
@@ -72,28 +75,44 @@ export class CallSession {
       }
     }, 100)
 
+    const closeCall = async (status: string) => {
+      isCallEnded = true
+      clearInterval(silenceTimer)
+      if (dgConnection) {
+        try { dgConnection.finish() } catch (e) {}
+      }
+      if (cartesiaWs) {
+        try { cartesiaWs.close() } catch (e) {}
+      }
+      try {
+        ws.close()
+      } catch (e) {}
+
+      try {
+        const current = await redis.hget(`call:${callSid}`, 'status')
+        if (current !== 'completed' && current !== 'ready' && current !== 'failed' && current !== 'disconnected') {
+          const startTime = await redis.hget(`call:${callSid}`, 'started_at') as number
+          const result = {
+            status,
+            ended_at: Date.now(),
+            duration_ms: startTime ? (Date.now() - startTime) : 0
+          }
+          await redis.hset(`call:${callSid}`, result)
+          await redis.publish('call-updates', JSON.stringify({ callSid, ...result }))
+        }
+      } catch (err) {
+        console.error('DO: Error in closeCall cleanup:', err)
+      }
+    }
+
     let openai: OpenAI
     let deepgram: ReturnType<typeof createClient>
     let dgConnection: any
     try {
       openai = new OpenAI({ apiKey: this.env.OPENAI_API_KEY })
       deepgram = createClient(this.env.DEEPGRAM_KEY)
-      dgConnection = deepgram.listen.live({
-        model: 'nova-2-medical',
-        language: 'en-US',
-        smart_format: true,
-        interim_results: true,
-        endpointing: 300,
-        utterance_end_ms: 1000,
-        vad_events: true,
-        // Twilio streams mulaw audio at 8kHz mono - must match exactly
-        encoding: 'mulaw',
-        sample_rate: 8000,
-        channels: 1
-      })
     } catch (err: any) {
       console.error('DO: Fatal initialization error:', err)
-      const redis = Redis.fromEnv(this.env)
       await redis.hset(`call:${callSid}`, { last_error: `Init error: ${err.message || err}` })
       ws.close(1011, `DO init error: ${err.message || err}`)
       return
@@ -102,24 +121,80 @@ export class CallSession {
     let isDgOpen = false
     const dgQueue: Buffer[] = []
 
-    dgConnection.on(LiveTranscriptionEvents.Open, () => {
-      console.log('DO: Deepgram connection opened')
-      isDgOpen = true
-      while (dgQueue.length > 0) {
-        const chunk = dgQueue.shift()
-        if (chunk) dgConnection.send(chunk)
+    const openDeepgram = () => {
+      if (isCallEnded) return
+      try {
+        console.log('DO: Connecting to Deepgram...')
+        dgConnection = deepgram.listen.live({
+          model: 'nova-2-medical',
+          language: 'en-US',
+          smart_format: true,
+          interim_results: true,
+          endpointing: 300,
+          utterance_end_ms: 1000,
+          vad_events: true,
+          // Twilio streams mulaw audio at 8kHz mono - must match exactly
+          encoding: 'mulaw',
+          sample_rate: 8000,
+          channels: 1
+        })
+
+        dgConnection.on(LiveTranscriptionEvents.Open, () => {
+          console.log('DO: Deepgram connection opened')
+          isDgOpen = true
+          while (dgQueue.length > 0) {
+            const chunk = dgQueue.shift()
+            if (chunk) dgConnection.send(chunk)
+          }
+        })
+
+        dgConnection.on(LiveTranscriptionEvents.Transcript, async (data: any) => {
+          const text = data.channel.alternatives[0].transcript
+          if (text && data.is_final) {
+            silenceMs = 0
+            await runLLM(text)
+          }
+        })
+
+        dgConnection.on(LiveTranscriptionEvents.SpeechStarted, () => {
+          if (isBotSpeaking) {
+            ws.send(JSON.stringify({ event: 'clear', streamSid }))
+            if (isCartesiaOpen && cartesiaWs) {
+              cartesiaWs.send(JSON.stringify({ context_id: streamSid, type: 'flush' }))
+            }
+            isFirstCartesiaChunk = true
+            isBotSpeaking = false
+          }
+        })
+
+        dgConnection.on(LiveTranscriptionEvents.VadEvents, (evt: any) => {
+          if (evt.label === 'speech' && silenceMs > 3000) runLLM('[Hold music detected]')
+        })
+
+        dgConnection.on(LiveTranscriptionEvents.Error, async (err: any) => {
+          console.error('DO: Deepgram error:', err)
+          await redis.hset(`call:${callSid}`, { last_error: `Deepgram error: ${err.message || err}` })
+          ws.send(JSON.stringify({ event: 'clear', streamSid }))
+          runLLM('[System error, please repeat]')
+        })
+
+        dgConnection.on(LiveTranscriptionEvents.Close, () => {
+          console.log('DO: Deepgram connection closed')
+          isDgOpen = false
+          if (!isCallEnded) {
+            console.log('DO: Deepgram closed unexpectedly, reconnecting in 1s...')
+            setTimeout(openDeepgram, 1000)
+          }
+        })
+      } catch (err: any) {
+        console.error('DO: Error opening Deepgram:', err)
+        if (!isCallEnded) {
+          setTimeout(openDeepgram, 1000)
+        }
       }
-    })
+    }
 
-    dgConnection.on(LiveTranscriptionEvents.Error, async (err: any) => {
-      console.error('DO: Deepgram error:', err)
-      await redis.hset(`call:${callSid}`, { last_error: `Deepgram error: ${err.message || err}` })
-    })
-
-    dgConnection.on(LiveTranscriptionEvents.Close, () => {
-      console.log('DO: Deepgram connection closed')
-      isDgOpen = false
-    })
+    openDeepgram()
 
     let cartesiaWs: WebSocket | null = null
     let isCartesiaOpen = false
@@ -128,6 +203,7 @@ export class CallSession {
 
     const openCartesia = async () => {
       isFirstCartesiaChunk = true
+      if (isCallEnded) return
       try {
         console.log('DO: Connecting to Cartesia...')
         const res = await fetch("https://api.cartesia.ai/tts/websocket?cartesia_version=2024-06-10", {
@@ -140,6 +216,10 @@ export class CallSession {
         if (!socket) {
           console.error("DO: Failed to connect to Cartesia (no socket returned)")
           await redis.hset(`call:${callSid}`, { last_error: 'Cartesia: no socket returned on connect' })
+          if (!isCallEnded) {
+            console.log('DO: Cartesia failed to connect, retrying in 1s...')
+            setTimeout(openCartesia, 1000)
+          }
           return
         }
         socket.accept()
@@ -177,10 +257,18 @@ export class CallSession {
         cartesiaWs.addEventListener('close', () => {
           console.log('DO: Cartesia WebSocket closed')
           isCartesiaOpen = false
+          if (!isCallEnded) {
+            console.log('DO: Cartesia closed unexpectedly, reopening in 1s...')
+            setTimeout(openCartesia, 1000)
+          }
         })
       } catch (err: any) {
         console.error("DO: Exception opening Cartesia:", err)
         await redis.hset(`call:${callSid}`, { last_error: `Cartesia connection error: ${err.message || err}` })
+        if (!isCallEnded) {
+          console.log('DO: Cartesia threw error on open, retrying in 1s...')
+          setTimeout(openCartesia, 1000)
+        }
       }
     }
 
@@ -292,37 +380,77 @@ Rules:
             llmMessages.push({ role: 'assistant', content: botText })
             await redis.hset(`call:${callSid}`, { last_llm_response: botText })
 
-            // Parse and execute text-based action commands
-            const dtmfMatch = botText.match(/\[DTMF:(\d+)\]/)
-            const waitMatch = botText.match(/\[WAITING\]/)
-            const endMatch = botText.match(/\[END:([^\]]+)\]/)
+            // 1. Check for DTMF
+            const dtmfMatch = botText.match(/(?:\[?DTMF\s*[:=]\s*(\d+)\]?)|(?:press_dtmf\s*\(\s*digit\s*=\s*["']?(\d+)["']?\s*\))/i)
+            const dtmfDigit = dtmfMatch ? (dtmfMatch[1] || dtmfMatch[2]) : null
 
-            if (dtmfMatch) {
-              console.log('DO: Pressing DTMF:', dtmfMatch[1])
-              ws.send(JSON.stringify({ event: 'dtmf', streamSid, dtmf: { digit: dtmfMatch[1] } }))
-            } else if (endMatch) {
-              const [status, payer, claim_id, amount, next_action] = endMatch[1].split(':')
-              console.log('DO: End call with result:', endMatch[1])
-              const startTime = await redis.hget(`call:${callSid}`, 'started_at') as number
-              const result = {
-                status: status || 'completed',
-                payer, claim_id,
-                amount: amount ? parseFloat(amount) : undefined,
-                next_action,
-                duration_ms: startTime ? (Date.now() - startTime) : 0,
-                ended_at: Date.now()
+            // 2. Check for End Call
+            const endMatch = botText.match(/\[?END\s*[:=]\s*([^\]\n]+)\]?/i)
+            const callEndedMatch = botText.match(/\[?CALL\s+ENDED\]?/i) || botText.match(/end_call/i)
+            const isEnd = !!(endMatch || callEndedMatch)
+
+            // 3. Check for WAITING
+            const isWaiting = /\[?WAITING\]?/i.test(botText) || /wait_for_human/i.test(botText)
+
+            // 4. Strip any markers so we don't speak them
+            const spokenText = botText
+              .replace(/(?:\[?DTMF\s*[:=]\s*\d+\]?)|(?:press_dtmf\s*\(\s*digit\s*=\s*["']?\d+["']?\s*\))/gi, '')
+              .replace(/\[?CALL\s+ENDED\]?/gi, '')
+              .replace(/\[?END\s*[:=]\s*[^\]]*\]?/gi, '')
+              .replace(/\[?WAITING\]?/gi, '')
+              .replace(/wait_for_human\s*\(\s*\)/gi, '')
+              .replace(/\[|\]/g, '') // Strip remaining brackets
+              .trim()
+
+            if (spokenText) {
+              isBotSpeaking = true
+              sendToCartesia(spokenText, false)
+            }
+
+            if (dtmfDigit) {
+              console.log('DO: Pressing DTMF:', dtmfDigit)
+              ws.send(JSON.stringify({ event: 'dtmf', streamSid, dtmf: { digit: dtmfDigit } }))
+            } else if (isEnd) {
+              console.log('DO: End call triggered')
+              let status = 'completed'
+              let payer = 'unknown'
+              let claim_id = 'unknown'
+              let amount: number | undefined = undefined
+              let next_action = 'none'
+
+              if (endMatch) {
+                const parts = endMatch[1].split(':')
+                status = parts[0] || 'completed'
+                payer = parts[1] || 'unknown'
+                claim_id = parts[2] || 'unknown'
+                amount = parts[3] ? parseFloat(parts[3]) : undefined
+                next_action = parts[4] || 'none'
               }
-              await redis.hset(`call:${callSid}`, { ...result, last_error: '' })
-              await redis.publish('call-updates', JSON.stringify({ callSid, ...result }))
-              ws.close()
-              return
-            } else if (!waitMatch) {
-              // Normal speech - speak to Cartesia (strip any leftover markers)
-              const spokenText = botText.replace(/\[DTMF:\d+\]|\[WAITING\]|\[END:[^\]]*\]/g, '').trim()
+
+              const finalizeCall = async () => {
+                const startTime = await redis.hget(`call:${callSid}`, 'started_at') as number
+                const result = {
+                  status,
+                  payer, claim_id,
+                  amount,
+                  next_action,
+                  duration_ms: startTime ? (Date.now() - startTime) : 0,
+                  ended_at: Date.now()
+                }
+                await redis.hset(`call:${callSid}`, { ...result, last_error: '' })
+                await redis.publish('call-updates', JSON.stringify({ callSid, ...result }))
+                await closeCall(status)
+              }
+
+              // Delay close if we are speaking a final goodbye
               if (spokenText) {
-                isBotSpeaking = true
-                sendToCartesia(spokenText, false)
+                setTimeout(() => {
+                  this.state.waitUntil(finalizeCall())
+                }, 3000)
+              } else {
+                this.state.waitUntil(finalizeCall())
               }
+              return
             }
           }
           return // Success!
@@ -396,7 +524,7 @@ Rules:
               }
               await redis.hset(`call:${callSid}`, result)
               await redis.publish('call-updates', JSON.stringify({ callSid, ...result }))
-              ws.close()
+              this.state.waitUntil(closeCall(args.status || 'completed'))
             }
           }
         } catch (err: any) {
@@ -405,27 +533,6 @@ Rules:
         }
       }
     }
-
-    dgConnection.on(LiveTranscriptionEvents.Transcript, async (data) => {
-      const text = data.channel.alternatives[0].transcript
-      if (text && data.is_final) {
-        silenceMs = 0
-        await runLLM(text)
-      }
-    })
-    dgConnection.on(LiveTranscriptionEvents.SpeechStarted, () => {
-      if (isBotSpeaking) {
-        ws.send(JSON.stringify({ event: 'clear', streamSid }))
-        if (isCartesiaOpen && cartesiaWs) {
-          cartesiaWs.send(JSON.stringify({ context_id: streamSid, type: 'flush' }))
-        }
-        isFirstCartesiaChunk = true
-        isBotSpeaking = false
-      }
-    })
-    dgConnection.on(LiveTranscriptionEvents.VadEvents, (evt) => {
-      if (evt.label === 'speech' && silenceMs > 3000) runLLM('[Hold music detected]')
-    })
 
     ws.addEventListener('message', async (evt) => {
       try {
@@ -437,45 +544,24 @@ Rules:
         }
         if (msg.event === 'media') {
           const chunk = Buffer.from(msg.media.payload, 'base64')
-          if (isDgOpen) {
+          if (isDgOpen && dgConnection) {
             dgConnection.send(chunk)
           } else {
             dgQueue.push(chunk)
           }
         }
         if (msg.event === 'stop') {
-          dgConnection.finish()
-          cartesiaWs?.close()
-          clearInterval(silenceTimer)
-          ws.close()
+          this.state.waitUntil(closeCall('disconnected'))
         }
       } catch (err: any) {
         console.error('DO: Error processing message:', err)
         await redis.hset(`call:${callSid}`, { last_error: `Message error: ${err.message || err}` })
-        ws.close(1011, `Message error: ${err.message || err}`)
+        this.state.waitUntil(closeCall('failed'))
       }
     })
 
     ws.addEventListener('close', () => {
-      clearInterval(silenceTimer)
-      const cleanup = async () => {
-        try {
-          const current = await redis.hget(`call:${callSid}`, 'status')
-          if (current !== 'completed' && current !== 'ready' && current !== 'failed' && current !== 'disconnected') {
-            const startTime = await redis.hget(`call:${callSid}`, 'started_at') as number
-            const result = {
-              status: 'disconnected',
-              ended_at: Date.now(),
-              duration_ms: startTime ? (Date.now() - startTime) : 0
-            }
-            await redis.hset(`call:${callSid}`, result)
-            await redis.publish('call-updates', JSON.stringify({ callSid, ...result }))
-          }
-        } catch (err) {
-          console.error('DO: Error in close cleanup:', err)
-        }
-      }
-      this.state.waitUntil(cleanup())
+      this.state.waitUntil(closeCall('disconnected'))
     })
   }
 }
