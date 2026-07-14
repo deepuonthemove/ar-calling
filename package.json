@@ -12,7 +12,8 @@
     "@deepgram/sdk": "^3.13.0",
     "@upstash/redis": "^1.38.0",
     "hono": "^4.12.30",
-    "openai": "^4.104.0"
+    "openai": "^4.104.0",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260702.1",

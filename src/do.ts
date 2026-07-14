@@ -61,6 +61,17 @@ export class CallSession {
     }
 
     const redis = this.redis
+    const callData: any = await redis.hgetall(`call:${callSid}`)
+    const accountUid = callData?.account_uid || ''
+
+    let firstGreeting = '[Call connected]'
+    let accountData: any = null
+    if (accountUid) {
+      accountData = await redis.hgetall(`account:${accountUid}`)
+      if (accountData) {
+        firstGreeting = `Hello, thank you. I am calling to check the status of a claim for patient ${accountData['Patient Name'] || 'unknown'}, Date of Service ${accountData['DOS'] || 'unknown'}, with billed amount $${accountData['Billed Amount'] || 'unknown'}.`
+      }
+    }
 
     let streamSid = ''
     let isBotSpeaking = false
@@ -99,6 +110,17 @@ export class CallSession {
           }
           await redis.hset(`call:${callSid}`, result)
           await redis.publish('call-updates', JSON.stringify({ callSid, ...result }))
+
+          // Update the Excel account row in Redis on early close
+          if (accountUid) {
+            const todayStr = new Date().toLocaleDateString('en-US')
+            const accountUpdate = {
+              'Call Comments': status === 'disconnected' ? 'Call disconnected' : 'Call failed during dialing',
+              'Call Date': todayStr,
+              'Call Status': status === 'disconnected' ? 'Disconnected' : 'Failed'
+            }
+            await redis.hset(`account:${accountUid}`, accountUpdate)
+          }
         }
       } catch (err) {
         console.error('DO: Error in closeCall cleanup:', err)
@@ -298,15 +320,35 @@ export class CallSession {
       }
     }
 
-    let llmMessages: any[] = [
-      {
-        role: 'system', content: `You are an AR specialist calling insurance payers.
+    let systemPrompt = `You are an AR specialist calling insurance payers.
 Rules:
 1. If you hear a menu like "Press 1 for claims", output ONLY this exact text: [DTMF:1] - nothing else.
 2. If silence >3s and you hear music/hold tones, output ONLY: [WAITING]
 3. When the call is resolved, output ONLY: [END:completed:PrayerName:ClaimID:Amount:NextAction] filling in the real values.
 4. For normal conversation, respond naturally in under 15 words.
-5. Never say things like "pressing 1" or describe your actions - just do them with the markers above.` }
+5. Never say things like "pressing 1" or describe your actions - just do them with the markers above.`
+
+    if (accountData) {
+      systemPrompt = `You are an AR specialist calling insurance payers to check the status of a specific medical claim.
+Here is the context for this call:
+- Patient Name: ${accountData['Patient Name'] || 'unknown'}
+- Date of Service (DOS): ${accountData['DOS'] || 'unknown'}
+- Billed Amount: $${accountData['Billed Amount'] || 'unknown'}
+- Procedure Code (CPT): ${accountData['CPT'] || 'unknown'}
+- Account Number: ${accountData['Account Number'] || 'unknown'}
+- Responsible Payer: ${accountData['Responsible Payer'] || 'unknown'}
+- Call Objective / Background: ${accountData['AR Final Comments'] || 'Call and check status of this claim.'}
+
+Rules:
+1. If you hear a menu like "Press 1 for claims", output ONLY this exact text: [DTMF:1] - nothing else.
+2. If silence >3s and you hear music/hold tones, output ONLY: [WAITING]
+3. When the call is resolved, output ONLY: [END:completed:${accountData['Responsible Payer'] || 'unknown'}:${accountData['Account Number'] || 'unknown'}:${accountData['Billed Amount'] || '0'}:Call Completed] filling in the real values.
+4. For normal conversation, respond naturally in under 15 words. Keep the focus entirely on resolving the objective.
+5. Never say things like "pressing 1" or describe your actions - just do them with the markers above.`
+    }
+
+    let llmMessages: any[] = [
+      { role: 'system', content: systemPrompt }
     ]
 
     const runLLM = async (userText: string) => {
@@ -439,6 +481,18 @@ Rules:
                 }
                 await redis.hset(`call:${callSid}`, { ...result, last_error: '' })
                 await redis.publish('call-updates', JSON.stringify({ callSid, ...result }))
+
+                // Update the Excel account row in Redis on success
+                if (accountUid) {
+                  const todayStr = new Date().toLocaleDateString('en-US')
+                  const accountUpdate = {
+                    'Call Comments': next_action || 'Call completed',
+                    'Call Date': todayStr,
+                    'Call Status': 'Calls Done'
+                  }
+                  await redis.hset(`account:${accountUid}`, accountUpdate)
+                }
+
                 await closeCall(status)
               }
 
@@ -540,7 +594,7 @@ Rules:
         if (msg.event === 'start') {
           streamSid = msg.start.streamSid
           openCartesia()
-          runLLM('[Call connected]')
+          runLLM(firstGreeting)
         }
         if (msg.event === 'media') {
           const chunk = Buffer.from(msg.media.payload, 'base64')
