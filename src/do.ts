@@ -31,7 +31,7 @@ export class CallSession {
       return new Response('ok')
     }
 
-    if (request.headers.get('Upgrade')!== 'websocket') {
+    if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('Expected WebSocket', { status: 400 })
     }
 
@@ -42,8 +42,15 @@ export class CallSession {
 
   async handleSession(ws: WebSocket, req: Request) {
     ws.accept()
-    const url = new URL(req.url)
-    const callSid = url.searchParams.get('callSid')!
+    console.log('DO: WebSocket connected', req.url.toString())
+    const url = new URL(req.url.toString())
+    const callSid = url.searchParams.get('callSid')
+    console.log('DO: callSid =', callSid)
+    if (!callSid) {
+      ws.close(1008, 'Missing callSid')
+      return
+    }
+
     const redis = Redis.fromEnv(this.env)
 
     let streamSid = ''
@@ -58,12 +65,7 @@ export class CallSession {
       }
     }, 100)
 
-    const openai = new OpenAI({
-      apiKey: this.env.AZURE_OPENAI_KEY,
-      baseURL: `${this.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${this.env.AZURE_OPENAI_DEPLOYMENT}`,
-      defaultQuery: { 'api-version': this.env.AZURE_OPENAI_API_VERSION },
-      defaultHeaders: { 'api-key': this.env.AZURE_OPENAI_KEY }
-    })
+    const openai = new OpenAI({ apiKey: this.env.OPENAI_API_KEY })
 
     const deepgram = createClient(this.env.DEEPGRAM_KEY)
     const dgConnection = deepgram.listen.live({
@@ -98,7 +100,8 @@ export class CallSession {
     }
 
     let llmMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-      { role: 'system', content: `You are an AR specialist calling insurance payers.
+      {
+        role: 'system', content: `You are an AR specialist calling insurance payers.
 Rules:
 1. If you hear "Press 1 for claims", remain silent and call press_dtmf(digit="1"). Never say "pressing 1".
 2. If silence >3s and you hear music/tones, call wait_for_human().
@@ -116,7 +119,7 @@ Rules:
 
       llmMessages.push({ role: 'user', content: userText })
       const stream = await openai.chat.completions.create({
-        model: this.env.AZURE_OPENAI_DEPLOYMENT,
+        model: this.env.LLM_MODEL || "gpt-5-nano",
         messages: llmMessages,
         tools: [
           { type: 'function', function: { name: 'press_dtmf', description: 'Press phone keypad digit', parameters: { type: 'object', properties: { digit: { type: 'string' } }, required: ['digit'] } } },
@@ -135,7 +138,7 @@ Rules:
           botText += delta.content
           if (!isBotSpeaking) {
             isBotSpeaking = true
-            if (!cartesiaWs || cartesiaWs.readyState!== 1) openCartesia()
+            if (!cartesiaWs || cartesiaWs.readyState !== 1) openCartesia()
           }
           cartesiaWs?.send(JSON.stringify({ type: 'text', text: delta.content, context_id: streamSid, continue: true }))
         }
@@ -160,7 +163,7 @@ Rules:
         }
         if (name === 'end_call') {
           const startTime = await redis.hget(`call:${callSid}`, 'started_at') as number
-          const result = { callSid,...args, duration_ms: Date.now() - startTime }
+          const result = { callSid, ...args, duration_ms: Date.now() - startTime }
           await fetch(new URL('/call-result', req.url).toString(), { method: 'POST', body: JSON.stringify(result) })
           ws.close()
         }
@@ -203,7 +206,7 @@ Rules:
     ws.addEventListener('close', async () => {
       clearInterval(silenceTimer)
       const current = await redis.hget(`call:${callSid}`, 'status')
-      if (current!== 'completed') {
+      if (current !== 'completed') {
         await fetch(new URL('/call-result', req.url).toString(), { method: 'POST', body: JSON.stringify({ callSid, status: 'failed' }) })
       }
     })

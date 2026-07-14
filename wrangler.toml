@@ -9,9 +9,8 @@ class_name = "CallSession"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["CallSession"]
+new_sqlite_classes = ["CallSession"]
 
 [vars]
-AZURE_OPENAI_API_VERSION = "2024-02-01"
-AZURE_OPENAI_DEPLOYMENT = "ar-agent-mini"
+LLM_MODEL = "gpt-5-nano"
 CARTESIA_VOICE_ID = "a0e99841-438c-4a64-b679-ae501e7d6091"

@@ -2,13 +2,11 @@ export interface Env {
   CALL_SESSION: DurableObjectNamespace
   UPSTASH_REDIS_REST_URL: string
   UPSTASH_REDIS_REST_TOKEN: string
-  AZURE_OPENAI_KEY: string
-  AZURE_OPENAI_ENDPOINT: string
-  AZURE_OPENAI_DEPLOYMENT: string
-  AZURE_OPENAI_API_VERSION: string
   DEEPGRAM_KEY: string
   CARTESIA_KEY: string
   CARTESIA_VOICE_ID: string
+  OPENAI_API_KEY: string;
+  LLM_MODEL: string; // add this
 }
 
 export interface CallResult {
