@@ -433,10 +433,9 @@ app.post('/api/upload-excel', async (c) => {
     const redis = Redis.fromEnv(c.env)
     
     // Clear old accounts list if any
-    const oldUidsStr = await redis.get('accounts-list')
-    if (oldUidsStr) {
+    const oldUids = await redis.get('accounts-list') as string[]
+    if (oldUids && Array.isArray(oldUids)) {
       try {
-        const oldUids = JSON.parse(oldUidsStr) as string[]
         for (const o of oldUids) {
           await redis.del(`account:${o}`)
         }
@@ -469,8 +468,8 @@ app.post('/api/upload-excel', async (c) => {
       await redis.hset(`account:${uid}`, formattedRow)
     }
 
-    await redis.set('accounts-headers', JSON.stringify(headers))
-    await redis.set('accounts-list', JSON.stringify(uids))
+    await redis.set('accounts-headers', headers)
+    await redis.set('accounts-list', uids)
 
     return c.json({ ok: true, count: rows.length })
   } catch (err: any) {
@@ -482,9 +481,8 @@ app.post('/api/upload-excel', async (c) => {
 app.get('/api/accounts', async (c) => {
   try {
     const redis = Redis.fromEnv(c.env)
-    const uidsStr = await redis.get('accounts-list') as string
-    if (!uidsStr) return c.json([])
-    const uids = JSON.parse(uidsStr) as string[]
+    const uids = await redis.get('accounts-list') as string[]
+    if (!uids || !Array.isArray(uids)) return c.json([])
 
     const accounts = []
     for (const uid of uids) {
@@ -502,12 +500,10 @@ app.get('/api/accounts', async (c) => {
 app.get('/api/export-excel', async (c) => {
   try {
     const redis = Redis.fromEnv(c.env)
-    const uidsStr = await redis.get('accounts-list') as string
-    if (!uidsStr) return c.text('No accounts to export', 404)
-    const uids = JSON.parse(uidsStr) as string[]
+    const uids = await redis.get('accounts-list') as string[]
+    if (!uids || !Array.isArray(uids)) return c.text('No accounts to export', 404)
 
-    const headersStr = await redis.get('accounts-headers') as string
-    const headers = headersStr ? JSON.parse(headersStr) : []
+    const headers = await redis.get('accounts-headers') as string[] || []
 
     const rows = []
     for (const uid of uids) {
