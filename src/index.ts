@@ -312,6 +312,50 @@ app.get('/dashboard', (c) => {
       }
 
       document.getElementById('upload-form').addEventListener('submit', uploadExcel)
+
+      document.getElementById('call-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const btn = document.getElementById('submit-btn');
+        const msg = document.getElementById('form-message');
+        const phone = document.getElementById('phone').value;
+        const payer = document.getElementById('payer').value;
+        const claim_id = document.getElementById('claim_id').value;
+        const account_uid = document.getElementById('account_uid').value;
+ 
+        btn.disabled = true;
+        btn.textContent = 'Placing Call...';
+        msg.className = 'mt-3 text-xs text-gray-400';
+        msg.textContent = 'Contacting Twilio...';
+        msg.classList.remove('hidden');
+ 
+        try {
+          const res = await fetch('/make-call', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phone, payer, claim_id, account_uid })
+          });
+          const data = await res.json();
+          if (res.ok) {
+            msg.className = 'mt-3 text-xs text-green-400';
+            msg.textContent = \`Call successfully triggered! Call SID: \${data.callSid}\`;
+            document.getElementById('phone').value = '';
+            document.getElementById('payer').value = '';
+            document.getElementById('claim_id').value = '';
+            document.getElementById('account_uid').value = '';
+            document.getElementById('active-claim-badge').textContent = 'No account loaded';
+            document.querySelectorAll('#account-rows tr').forEach(r => r.classList.remove('bg-blue-900/20', 'border-blue-800'));
+          } else {
+            msg.className = 'mt-3 text-xs text-red-400';
+            msg.textContent = \`Error: \${data.error}\`;
+          }
+        } catch (err) {
+          msg.className = 'mt-3 text-xs text-red-400';
+          msg.textContent = \`Failed to connect to backend: \${err.message}\`;
+        } finally {
+          btn.disabled = false;
+          btn.textContent = 'Place Outbound Call';
+        }
+      });
       
       // Init
       fetchAccounts()
