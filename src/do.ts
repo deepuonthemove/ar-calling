@@ -301,7 +301,7 @@ export class CallSession {
       if (isFirstCartesiaChunk) {
         isFirstCartesiaChunk = false
         payload = {
-          model_id: 'sonic-2',
+          model_id: 'sonic-english',
           voice: { mode: 'id', id: this.env.CARTESIA_VOICE_ID },
           output_format: { container: 'raw', encoding: 'pcm_mulaw', sample_rate: 8000 },
           language: 'en',
