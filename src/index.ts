@@ -286,7 +286,10 @@ app.get('/dashboard', (c) => {
             \`
             accountRows.appendChild(tr)
           })
+        } catch (err) {
+          console.error('Failed to fetch accounts:', err)
         }
+      }
 
       async function fetchCalls() {
         try {
