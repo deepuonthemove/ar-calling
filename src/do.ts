@@ -34,7 +34,7 @@ export class CallSession {
       return new Response('ok')
     }
 
-    if (request.headers.get('Upgrade') !== 'websocket') {
+    if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
       return new Response('Expected WebSocket', { status: 400 })
     }
 
